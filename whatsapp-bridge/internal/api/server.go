@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"go.mau.fi/whatsmeow"
+
 	"whatsapp-client/internal/polls"
 	"whatsapp-client/internal/queue"
 )
@@ -42,6 +44,7 @@ type WhatsApp interface {
 	// SendPoll returns the poll's message id and the chat JID it went to (needed to match votes).
 	SendPoll(ctx context.Context, to, question string, options []string, selectable int) (messageID, chatJID string, err error)
 	Health() Health
+	Groups
 }
 
 type Config struct {
@@ -73,6 +76,7 @@ func New(cfg Config, wa WhatsApp, q *queue.Store, p *polls.Store) (*Server, erro
 	s.mux.Handle("POST /v1/events/ack", s.require(scopeBridge, s.ackEvents))
 	s.mux.Handle("POST /v1/messages", s.require(scopeNotify, s.sendMessage))
 	s.mux.Handle("POST /v1/polls", s.require(scopeBridge, s.sendPoll))
+	s.routeGroups()
 	return s, nil
 }
 
@@ -171,7 +175,7 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	id, err := s.wa.SendText(r.Context(), req.To, req.Text)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "WhatsApp send failed: "+err.Error())
+		waFailed(w, "send", err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"message_id": id})
@@ -195,7 +199,7 @@ func (s *Server) sendPoll(w http.ResponseWriter, r *http.Request) {
 	selectable := max(req.Selectable, 1)
 	id, chat, err := s.wa.SendPoll(r.Context(), req.To, req.Question, req.Options, selectable)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "WhatsApp send failed: "+err.Error())
+		waFailed(w, "send", err)
 		return
 	}
 	if err := s.p.Save(id, chat, req.Options); err != nil {
@@ -237,6 +241,16 @@ func intParam(r *http.Request, name string) (int64, error) {
 		err = errors.New("negative")
 	}
 	return n, err
+}
+
+// waFailed reports a WhatsApp error: 429 when WhatsApp is rate-limiting this number
+// (the caller must back off: retrying fast on an unofficial client risks a ban), else 502.
+func waFailed(w http.ResponseWriter, what string, err error) {
+	status := http.StatusBadGateway
+	if errors.Is(err, whatsmeow.ErrIQRateOverLimit) {
+		status = http.StatusTooManyRequests
+	}
+	writeError(w, status, "WhatsApp "+what+" failed: "+err.Error())
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

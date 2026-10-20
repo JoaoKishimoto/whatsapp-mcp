@@ -437,22 +437,13 @@ func senderID(client *whatsmeow.Client, src types.MessageSource) string {
 }
 
 // waClient adapts whatsmeow to api.WhatsApp.
-type waClient struct{ c *whatsmeow.Client }
-
-// recipientJID accepts phone digits or a full JID.
-func recipientJID(to string) (types.JID, error) {
-	if !strings.Contains(to, "@") {
-		return types.NewJID(to, types.DefaultUserServer), nil
-	}
-	jid, err := types.ParseJID(to)
-	if err != nil {
-		return jid, fmt.Errorf("invalid recipient: %w", err)
-	}
-	return jid, nil
+type waClient struct {
+	c      *whatsmeow.Client
+	groups *wa.GroupCache
 }
 
 func (w waClient) SendText(ctx context.Context, to, text string) (string, error) {
-	jid, err := recipientJID(to)
+	jid, err := wa.ParseRecipient(to)
 	if err != nil {
 		return "", err
 	}
@@ -462,7 +453,7 @@ func (w waClient) SendText(ctx context.Context, to, text string) (string, error)
 
 // SendPoll sends a poll; whatsmeow stores its secret so votes can be decrypted later.
 func (w waClient) SendPoll(ctx context.Context, to, question string, options []string, selectable int) (string, string, error) {
-	jid, err := recipientJID(to)
+	jid, err := wa.ParseRecipient(to)
 	if err != nil {
 		return "", "", err
 	}
@@ -475,12 +466,23 @@ func (w waClient) Health() api.Health {
 }
 
 // queueMessage puts a live message on the bridge's event queue.
-func queueMessage(client *whatsmeow.Client, q *queue.Store, evt *events.Message, logger waLog.Logger) {
+func queueMessage(client *whatsmeow.Client, groups *wa.GroupCache, q *queue.Store, evt *events.Message, logger waLog.Logger) {
 	msg, ok := wa.Normalize(evt)
 	if !ok {
 		return
 	}
 	msg.Sender = withPN(client, msg.Sender)
+	if msg.ChatKind == "group" {
+		// Community, announcement channel or topic group: the bridge routes on this (PLANO.md §5).
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		g, err := groups.Get(ctx, evt.Info.Chat)
+		cancel()
+		if err != nil {
+			logger.Warnf("Group info for %s unavailable, queued as plain group: %v", evt.Info.Chat, err)
+		} else {
+			wa.ApplyGroup(&msg, g)
+		}
+	}
 	if _, err := q.Append("message", msg); err != nil {
 		logger.Errorf("Failed to queue message %s: %v", msg.MessageID, err)
 	}
@@ -948,6 +950,7 @@ func main() {
 		return
 	}
 	defer eventQueue.Close()
+	groupCache := wa.NewGroupCache(client.GetGroupInfo, 10*time.Minute)
 	pollStore, err := polls.Open("store/polls.db")
 	if err != nil {
 		logger.Errorf("Failed to open poll store: %v", err)
@@ -958,7 +961,7 @@ func main() {
 		BridgeToken: os.Getenv("TOKEN_BRIDGE"),
 		NotifyToken: os.Getenv("TOKEN_NOTIFY"),
 		OwnerPhone:  os.Getenv("OWNER_PHONE"),
-	}, waClient{client}, eventQueue, pollStore)
+	}, waClient{c: client, groups: groupCache}, eventQueue, pollStore)
 	if err != nil {
 		logger.Errorf("Invalid API config: %v", err)
 		return
@@ -992,7 +995,16 @@ func main() {
 			}
 			// Process regular messages
 			handleMessage(client, messageStore, v, logger)
-			queueMessage(client, eventQueue, v, logger)
+			queueMessage(client, groupCache, eventQueue, v, logger)
+
+		case *events.JoinedGroup:
+			groupCache.Put(&v.GroupInfo)
+			if _, err := eventQueue.Append("group_joined", wa.Joined(v)); err != nil {
+				logger.Errorf("Failed to queue group_joined for %s: %v", v.JID, err)
+			}
+
+		case *events.GroupInfo:
+			groupCache.Forget(v.JID) // name, participants or community link changed
 
 		case *events.HistorySync:
 			// Process history sync events

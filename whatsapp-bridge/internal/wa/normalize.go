@@ -31,22 +31,24 @@ type Attachment struct {
 }
 
 type Message struct {
-	MessageID  string      `json:"message_id"`
-	EditOf     string      `json:"edit_of,omitempty"` // set when this is an edit of an earlier message
-	Timestamp  time.Time   `json:"timestamp"`
-	ChatJID    string      `json:"chat_jid"`
-	ChatKind   string      `json:"chat_kind"` // dm | group | broadcast | newsletter
-	Sender     Person      `json:"sender"`
-	IsFromMe   bool        `json:"is_from_me"`
-	Text       string      `json:"text,omitempty"`
-	Quoted     *Quoted     `json:"quoted,omitempty"`
-	Attachment *Attachment `json:"attachment,omitempty"`
+	MessageID string    `json:"message_id"`
+	EditOf    string    `json:"edit_of,omitempty"` // set when this is an edit of an earlier message
+	Timestamp time.Time `json:"timestamp"`
+	ChatJID   string    `json:"chat_jid"`
+	ChatKind  string    `json:"chat_kind"` // dm | group | announcement | community | broadcast | newsletter
+	// GroupParentJID is the community a group belongs to. Set, with ChatKind, by ApplyGroup.
+	GroupParentJID string      `json:"group_parent_jid,omitempty"`
+	Sender         Person      `json:"sender"`
+	IsFromMe       bool        `json:"is_from_me"`
+	Text           string      `json:"text,omitempty"`
+	Quoted         *Quoted     `json:"quoted,omitempty"`
+	Attachment     *Attachment `json:"attachment,omitempty"`
 }
 
 // Normalize converts a whatsmeow message. ok is false for messages the gateway
 // never forwards (status updates) and for messages with nothing to show
 // (reactions, receipts of protocol actions, unknown types).
-// Community vs. plain group needs GroupInfo, so the caller refines ChatKind.
+// Community vs. plain group needs GroupInfo, so the caller refines ChatKind with ApplyGroup.
 func Normalize(evt *events.Message) (msg Message, ok bool) {
 	info := evt.Info
 	if info.Chat == types.StatusBroadcastJID {
@@ -86,8 +88,13 @@ func Normalize(evt *events.Message) (msg Message, ok bool) {
 // SenderOf fills phone and LID from whichever of Sender/SenderAlt carries each.
 // The device suffix (":12") is dropped so phone, Web and Desktop all match.
 func SenderOf(src types.MessageSource) Person {
+	return personOf(src.Sender, src.SenderAlt)
+}
+
+// personOf takes the first phone JID and the first LID among jids.
+func personOf(jids ...types.JID) Person {
 	var p Person
-	for _, jid := range []types.JID{src.Sender, src.SenderAlt} {
+	for _, jid := range jids {
 		switch jid.Server {
 		case types.DefaultUserServer:
 			if p.PN == "" {

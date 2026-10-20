@@ -2,6 +2,10 @@
 # A0 check for the gateway (PLANO.md §12). Run from this folder while the gateway is running:
 #   (set -a; . ./.env; set +a; bash a0-check.sh)        # checks + lists events
 #   (set -a; . ./.env; set +a; bash a0-check.sh poll)   # also sends you a test poll first
+#   (set -a; . ./.env; set +a; bash a0-check.sh poll 1203…@g.us)   # same, inside a group
+#   (set -a; . ./.env; set +a; bash a0-check.sh groups) # creates a test community + topic group with you as admin
+#   (set -a; . ./.env; set +a; bash a0-check.sh groups 1203…@g.us)  # reuses that community, creates only the topic group
+# A 429 (rate-overlimit) means WhatsApp is limiting this number: wait hours, do not retry in a loop.
 # Reads TOKEN_BRIDGE, TOKEN_NOTIFY and OWNER_PHONE from the environment and never prints the tokens.
 # Read-only on the queue: it does not ack events, so you can run it again.
 set -u
@@ -56,11 +60,60 @@ check "notify token sends a message" 200 \
 	"$(call POST /v1/messages "$TOKEN_NOTIFY" '{"to":"5500000000000","text":"A0: teste do gateway (token notify). Se chegou aqui, o envio funciona."}')"
 echo "      -> confirm on your phone that the message arrived in your chat with the bot"
 
+# field NAME -> prints a top-level string field of the last response
+field() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$body" "$1" 2>/dev/null; }
+
+# show_group -> prints the last response (a group) without its invite link or other secrets
+show_group() {
+	python3 - "$body" <<'PY'
+import json, sys
+g = json.load(open(sys.argv[1]))
+if not g.get("jid"):
+    sys.exit(0)  # the FAIL line above already shows the error
+print(f"      {g.get('kind')} {g.get('name')!r} jid={g.get('jid')} parent={g.get('parent_jid', '-')}")
+for p in g.get("participants", []):
+    print(f"         member pn={p.get('pn', '-')} lid={p.get('lid', '-')} admin={p.get('is_admin')} error={p.get('error', 0)}")
+PY
+}
+
 if [ "${1:-}" = "poll" ]; then
 	echo "== 3b. Poll"
-	check "bridge token sends a poll" 200 \
-		"$(call POST /v1/polls "$TOKEN_BRIDGE" "{\"to\":\"$OWNER_PHONE\",\"question\":\"A0: qual modelo?\",\"options\":[\"Haiku\",\"Sonnet\",\"Opus\"]}")"
+	target="${2:-$OWNER_PHONE}"
+	check "bridge token sends a poll to $target" 200 \
+		"$(call POST /v1/polls "$TOKEN_BRIDGE" "{\"to\":\"$target\",\"question\":\"A0: qual modelo?\",\"options\":[\"Haiku\",\"Sonnet\",\"Opus\"]}")"
 	echo "      -> on your phone: vote, change the vote, then uncheck it; then run this script again without 'poll'"
+fi
+
+if [ "${1:-}" = "groups" ]; then
+	echo "== 3c. Community and topic group"
+	community="${2:-}"
+	if [ -n "$community" ]; then
+		check "community $community exists" 200 "$(call GET "/v1/groups/$community" "$TOKEN_BRIDGE")"
+		[ "$(field kind)" = "community" ] || community=""
+	else
+		check "create a community" 200 "$(call POST /v1/groups "$TOKEN_BRIDGE" '{"name":"🧪 A0 Comunidade","description":"Teste A0 do gateway","community":true}')"
+		community=$(field jid)
+	fi
+	show_group
+	if [ -n "$community" ]; then
+		check "create a group in it with you" 200 \
+			"$(call POST /v1/groups "$TOKEN_BRIDGE" "{\"name\":\"🧪 A0 Tópico\",\"participants\":[\"$OWNER_PHONE\"],\"parent\":\"$community\"}")"
+		topic=$(field jid)
+		show_group
+	fi
+	if [ -n "${topic:-}" ]; then
+		check "promote you to admin" 200 \
+			"$(call POST "/v1/groups/$topic/participants" "$TOKEN_BRIDGE" "{\"action\":\"promote\",\"participants\":[\"$OWNER_PHONE\"]}")"
+		# Joining the topic group made you a community member; as its admin you can delete the test community later.
+		check "promote you in the community" 200 \
+			"$(call POST "/v1/groups/$community/participants" "$TOKEN_BRIDGE" "{\"action\":\"promote\",\"participants\":[\"$OWNER_PHONE\"]}")"
+		check "read the group back" 200 "$(call GET "/v1/groups/$topic" "$TOKEN_BRIDGE")"
+		show_group
+		check "get an invite link (not shown)" 200 "$(call GET "/v1/groups/$topic/invite" "$TOKEN_BRIDGE")"
+		echo "      -> on your phone: send a message in '🧪 A0 Tópico' and reply quoting it;"
+		echo "         then: bash a0-check.sh poll $topic   (vote in the group), and run without arguments to list events."
+		echo "         When done, delete both test groups from your phone (you are admin)."
+	fi
 fi
 
 echo "== 4. Receiving (messages sent to the bot since the gateway started)"
@@ -82,10 +135,16 @@ for e in events:
     if e["type"] == "poll_vote":
         v = d.get("voter", {})
         print(f"      #{e['id']} poll_vote  poll={d.get('poll_message_id')}  voter pn={v.get('pn', '-')} lid={v.get('lid', '-')}")
-        print(f"         selected {d.get('selected')}")
+        print(f"         selected {d.get('selected')}  chat={d.get('chat_jid')}")
+        continue
+    if e["type"] == "group_joined":
+        by = d.get("added_by") or {}
+        print(f"      #{e['id']} group_joined  {d.get('kind')} {d.get('name')!r} jid={d.get('jid')} parent={d.get('parent_jid', '-')} added_by pn={by.get('pn', '-')}")
         continue
     s = d.get("sender", {})
-    print(f"      #{e['id']} {e['type']}  chat={d.get('chat_kind')}  from_me={d.get('is_from_me')}  edit_of={d.get('edit_of', '-')}")
+    print(f"      #{e['id']} {e['type']}  chat={d.get('chat_kind')}  parent={d.get('group_parent_jid', '-')}  from_me={d.get('is_from_me')}  edit_of={d.get('edit_of', '-')}")
+    if d.get("chat_kind") != "dm":
+        print(f"         chat_jid {d.get('chat_jid')}")
     print(f"         sender  pn={s.get('pn', '-')}  lid={s.get('lid', '-')}  name={s.get('push_name', '-')}")
     print(f"         text    {d.get('text', '')[:80]!r}")
     if "quoted" in d:
@@ -103,6 +162,14 @@ print(f"      arrived with a LID: {any('lid' in m.get('sender', {}) for m in min
 print(f"      a quote was read: {any('quoted' in m for m in mine)}")
 print(f"      poll votes decrypted: {len(votes)}")
 print(f"      an unchecked vote arrived as empty: {any(v.get('selected') == [] for v in votes)}")
+in_groups = [e["data"] for e in events if e["type"] == "message" and e["data"].get("chat_kind") == "group" and not e["data"].get("is_from_me")]
+print(f"      group_joined events: {sum(e['type'] == 'group_joined' for e in events)}")
+print(f"      your messages in a group: {len(in_groups)}")
+print(f"        with your phone: {any(m.get('sender', {}).get('pn') == owner for m in in_groups)}")
+print(f"        with a LID: {any('lid' in m.get('sender', {}) for m in in_groups)}")
+print(f"        with the community as parent: {any('group_parent_jid' in m for m in in_groups)}")
+print(f"        a quote was read: {any('quoted' in m for m in in_groups)}")
+print(f"      poll votes in a group: {sum(v.get('chat_jid', '').endswith('@g.us') for v in votes)}")
 PY
 
 echo "== Result: $pass passed, $fail failed"
