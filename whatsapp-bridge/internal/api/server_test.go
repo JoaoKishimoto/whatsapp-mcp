@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"whatsapp-client/internal/polls"
 	"whatsapp-client/internal/queue"
 )
 
@@ -21,9 +22,24 @@ const (
 
 type sent struct{ to, text string }
 
+type sentPoll struct {
+	to, question string
+	options      []string
+	selectable   int
+}
+
 type fakeWA struct {
-	sent []sent
-	fail bool
+	sent  []sent
+	polls []sentPoll
+	fail  bool
+}
+
+func (f *fakeWA) SendPoll(_ context.Context, to, question string, options []string, selectable int) (string, string, error) {
+	if f.fail {
+		return "", "", errors.New("not connected")
+	}
+	f.polls = append(f.polls, sentPoll{to, question, options, selectable})
+	return "3EB0POLL", to + "@s.whatsapp.net", nil
 }
 
 func (f *fakeWA) SendText(_ context.Context, to, text string) (string, error) {
@@ -37,18 +53,28 @@ func (f *fakeWA) SendText(_ context.Context, to, text string) (string, error) {
 func (f *fakeWA) Health() Health { return Health{Connected: true, LoggedIn: true} }
 
 func setup(t *testing.T) (*Server, *fakeWA, *queue.Store) {
+	s, wa, q, _ := setupWithPolls(t)
+	return s, wa, q
+}
+
+func setupWithPolls(t *testing.T) (*Server, *fakeWA, *queue.Store, *polls.Store) {
 	t.Helper()
 	q, err := queue.Open(filepath.Join(t.TempDir(), "events.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { q.Close() })
-	wa := &fakeWA{}
-	s, err := New(Config{BridgeToken: bridgeTok, NotifyToken: notifyTok, OwnerPhone: owner}, wa, q)
+	p, err := polls.Open(filepath.Join(t.TempDir(), "polls.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return s, wa, q
+	t.Cleanup(func() { p.Close() })
+	wa := &fakeWA{}
+	s, err := New(Config{BridgeToken: bridgeTok, NotifyToken: notifyTok, OwnerPhone: owner}, wa, q, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s, wa, q, p
 }
 
 func do(s http.Handler, method, path, token, body string) *httptest.ResponseRecorder {
@@ -68,7 +94,7 @@ func TestNewRefusesBadConfig(t *testing.T) {
 		{BridgeToken: "same", NotifyToken: "same", OwnerPhone: owner},
 		{BridgeToken: "b", NotifyToken: "n"},
 	} {
-		if _, err := New(cfg, &fakeWA{}, nil); err == nil {
+		if _, err := New(cfg, &fakeWA{}, nil, nil); err == nil {
 			t.Errorf("accepted %+v", cfg)
 		}
 	}
@@ -189,5 +215,48 @@ func TestBridgeOnlyGuardsLegacyRoutes(t *testing.T) {
 	}
 	if do(h, "POST", "/api/send", bridgeTok, ""); !called {
 		t.Error("bridge token blocked")
+	}
+}
+
+func TestPollSentAndOptionsSaved(t *testing.T) {
+	s, wa, _, p := setupWithPolls(t)
+	w := do(s, "POST", "/v1/polls", bridgeTok, `{"to":"5571999999999","question":"Modelo?","options":["Haiku","Sonnet"]}`)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "3EB0POLL") {
+		t.Fatalf("got %d %s", w.Code, w.Body)
+	}
+	if len(wa.polls) != 1 || wa.polls[0].selectable != 1 {
+		t.Errorf("polls = %+v, want one with selectable defaulting to 1", wa.polls)
+	}
+	if opts, ok, _ := p.Options("3EB0POLL"); !ok || len(opts) != 2 || opts[1] != "Sonnet" {
+		t.Errorf("saved options = %v ok=%v", opts, ok)
+	}
+}
+
+func TestPollNeedsBridgeToken(t *testing.T) {
+	s, wa, _ := setup(t)
+	w := do(s, "POST", "/v1/polls", notifyTok, `{"to":"55","question":"q","options":["a","b"]}`)
+	if w.Code != 403 || len(wa.polls) != 0 {
+		t.Errorf("got %d, polls=%v", w.Code, wa.polls)
+	}
+}
+
+func TestPollValidation(t *testing.T) {
+	s, wa, _ := setup(t)
+	for _, body := range []string{
+		`{"question":"q","options":["a","b"]}`,
+		`{"to":"55","question":" ","options":["a","b"]}`,
+		`{"to":"55","question":"q","options":["a"]}`,
+		`{"to":"55","question":"q","options":["1","2","3","4","5","6","7","8","9","10","11","12","13"]}`,
+		`{"to":"55","question":"q","options":["a","a"]}`,
+		`{"to":"55","question":"q","options":["a",""]}`,
+		`{"to":"55","question":"q","options":["a","b"],"selectable":3}`,
+		`{"to":"55","question":"q","options":["a","b"],"selectable":-1}`,
+	} {
+		if w := do(s, "POST", "/v1/polls", bridgeTok, body); w.Code != 400 {
+			t.Errorf("%s: got %d", body, w.Code)
+		}
+	}
+	if len(wa.polls) != 0 {
+		t.Errorf("sent %v", wa.polls)
 	}
 }

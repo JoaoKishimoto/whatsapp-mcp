@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # A0 check for the gateway (PLANO.md §12). Run from this folder while the gateway is running:
-#   (set -a; . ./.env; set +a; bash a0-check.sh)
+#   (set -a; . ./.env; set +a; bash a0-check.sh)        # checks + lists events
+#   (set -a; . ./.env; set +a; bash a0-check.sh poll)   # also sends you a test poll first
 # Reads TOKEN_BRIDGE, TOKEN_NOTIFY and OWNER_PHONE from the environment and never prints the tokens.
 # Read-only on the queue: it does not ack events, so you can run it again.
 set -u
@@ -55,6 +56,13 @@ check "notify token sends a message" 200 \
 	"$(call POST /v1/messages "$TOKEN_NOTIFY" '{"to":"5500000000000","text":"A0: teste do gateway (token notify). Se chegou aqui, o envio funciona."}')"
 echo "      -> confirm on your phone that the message arrived in your chat with the bot"
 
+if [ "${1:-}" = "poll" ]; then
+	echo "== 3b. Poll"
+	check "bridge token sends a poll" 200 \
+		"$(call POST /v1/polls "$TOKEN_BRIDGE" "{\"to\":\"$OWNER_PHONE\",\"question\":\"A0: qual modelo?\",\"options\":[\"Haiku\",\"Sonnet\",\"Opus\"]}")"
+	echo "      -> on your phone: vote, change the vote, then uncheck it; then run this script again without 'poll'"
+fi
+
 echo "== 4. Receiving (messages sent to the bot since the gateway started)"
 check "bridge token reads events" 200 "$(call GET '/v1/events?after=0' "$TOKEN_BRIDGE")"
 python3 - "$body" "$OWNER_PHONE" <<'PY'
@@ -71,6 +79,11 @@ if not events:
 
 for e in events:
     d = e["data"]
+    if e["type"] == "poll_vote":
+        v = d.get("voter", {})
+        print(f"      #{e['id']} poll_vote  poll={d.get('poll_message_id')}  voter pn={v.get('pn', '-')} lid={v.get('lid', '-')}")
+        print(f"         selected {d.get('selected')}")
+        continue
     s = d.get("sender", {})
     print(f"      #{e['id']} {e['type']}  chat={d.get('chat_kind')}  from_me={d.get('is_from_me')}  edit_of={d.get('edit_of', '-')}")
     print(f"         sender  pn={s.get('pn', '-')}  lid={s.get('lid', '-')}  name={s.get('push_name', '-')}")
@@ -81,12 +94,15 @@ for e in events:
     if "attachment" in d:
         print(f"         attach  {d['attachment']}")
 
-mine = [e["data"] for e in events if e["data"].get("chat_kind") == "dm" and not e["data"].get("is_from_me")]
+mine = [e["data"] for e in events if e["type"] == "message" and e["data"].get("chat_kind") == "dm" and not e["data"].get("is_from_me")]
+votes = [e["data"] for e in events if e["type"] == "poll_vote"]
 print("      -- what A0 needs to know:")
 print(f"      your DMs to the bot: {len(mine)}")
 print(f"      arrived with your phone (pn = OWNER_PHONE): {any(m.get('sender', {}).get('pn') == owner for m in mine)}")
 print(f"      arrived with a LID: {any('lid' in m.get('sender', {}) for m in mine)}")
 print(f"      a quote was read: {any('quoted' in m for m in mine)}")
+print(f"      poll votes decrypted: {len(votes)}")
+print(f"      an unchecked vote arrived as empty: {any(v.get('selected') == [] for v in votes)}")
 PY
 
 echo "== Result: $pass passed, $fail failed"

@@ -30,6 +30,7 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 	"whatsapp-client/internal/api"
+	"whatsapp-client/internal/polls"
 	"whatsapp-client/internal/queue"
 	"whatsapp-client/internal/wa"
 )
@@ -438,16 +439,35 @@ func senderID(client *whatsmeow.Client, src types.MessageSource) string {
 // waClient adapts whatsmeow to api.WhatsApp.
 type waClient struct{ c *whatsmeow.Client }
 
-func (w waClient) SendText(ctx context.Context, to, text string) (string, error) {
-	jid, err := types.ParseJID(to)
+// recipientJID accepts phone digits or a full JID.
+func recipientJID(to string) (types.JID, error) {
 	if !strings.Contains(to, "@") {
-		jid, err = types.NewJID(to, types.DefaultUserServer), nil
+		return types.NewJID(to, types.DefaultUserServer), nil
 	}
+	jid, err := types.ParseJID(to)
 	if err != nil {
-		return "", fmt.Errorf("invalid recipient: %w", err)
+		return jid, fmt.Errorf("invalid recipient: %w", err)
+	}
+	return jid, nil
+}
+
+func (w waClient) SendText(ctx context.Context, to, text string) (string, error) {
+	jid, err := recipientJID(to)
+	if err != nil {
+		return "", err
 	}
 	resp, err := w.c.SendMessage(ctx, jid, &waProto.Message{Conversation: proto.String(text)})
 	return resp.ID, err
+}
+
+// SendPoll sends a poll; whatsmeow stores its secret so votes can be decrypted later.
+func (w waClient) SendPoll(ctx context.Context, to, question string, options []string, selectable int) (string, string, error) {
+	jid, err := recipientJID(to)
+	if err != nil {
+		return "", "", err
+	}
+	resp, err := w.c.SendMessage(ctx, jid, w.c.BuildPollCreation(question, options, selectable))
+	return resp.ID, jid.String(), err
 }
 
 func (w waClient) Health() api.Health {
@@ -463,6 +483,32 @@ func queueMessage(client *whatsmeow.Client, q *queue.Store, evt *events.Message,
 	msg.Sender = withPN(client, msg.Sender)
 	if _, err := q.Append("message", msg); err != nil {
 		logger.Errorf("Failed to queue message %s: %v", msg.MessageID, err)
+	}
+}
+
+// queuePollVote decrypts a vote on one of the gateway's polls and queues it as poll_vote.
+// Votes on polls the gateway did not send (or forgot after 30 days) are ignored.
+func queuePollVote(client *whatsmeow.Client, pollStore *polls.Store, q *queue.Store, evt *events.Message, logger waLog.Logger) {
+	pollID := evt.Message.GetPollUpdateMessage().GetPollCreationMessageKey().GetID()
+	options, ok, err := pollStore.Options(pollID)
+	if err != nil {
+		logger.Errorf("Failed to read poll %s: %v", pollID, err)
+		return
+	}
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	vote, err := client.DecryptPollVote(ctx, evt)
+	if err != nil {
+		logger.Warnf("Failed to decrypt vote on poll %s: %v", pollID, err)
+		return
+	}
+	v := wa.Vote(evt, options, vote.GetSelectedOptions())
+	v.Voter = withPN(client, v.Voter)
+	if _, err := q.Append("poll_vote", v); err != nil {
+		logger.Errorf("Failed to queue vote on poll %s: %v", pollID, err)
 	}
 }
 
@@ -902,11 +948,17 @@ func main() {
 		return
 	}
 	defer eventQueue.Close()
+	pollStore, err := polls.Open("store/polls.db")
+	if err != nil {
+		logger.Errorf("Failed to open poll store: %v", err)
+		return
+	}
+	defer pollStore.Close()
 	apiServer, err := api.New(api.Config{
 		BridgeToken: os.Getenv("TOKEN_BRIDGE"),
 		NotifyToken: os.Getenv("TOKEN_NOTIFY"),
 		OwnerPhone:  os.Getenv("OWNER_PHONE"),
-	}, waClient{client}, eventQueue)
+	}, waClient{client}, eventQueue, pollStore)
 	if err != nil {
 		logger.Errorf("Invalid API config: %v", err)
 		return
@@ -915,6 +967,9 @@ func main() {
 		for range time.Tick(time.Hour) {
 			if _, err := eventQueue.Cleanup(); err != nil {
 				logger.Warnf("Event queue cleanup failed: %v", err)
+			}
+			if _, err := pollStore.Cleanup(); err != nil {
+				logger.Warnf("Poll store cleanup failed: %v", err)
 			}
 		}
 	}()
@@ -931,6 +986,10 @@ func main() {
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
+			if v.Message.GetPollUpdateMessage() != nil {
+				queuePollVote(client, pollStore, eventQueue, v, logger)
+				break
+			}
 			// Process regular messages
 			handleMessage(client, messageStore, v, logger)
 			queueMessage(client, eventQueue, v, logger)

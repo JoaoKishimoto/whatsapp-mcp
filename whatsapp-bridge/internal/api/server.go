@@ -12,13 +12,15 @@ import (
 	"strings"
 	"time"
 
+	"whatsapp-client/internal/polls"
 	"whatsapp-client/internal/queue"
 )
 
 const (
-	maxWait   = 25 * time.Second
-	pageSize  = 100
-	maxBodyKB = 1024
+	maxWait        = 25 * time.Second
+	pageSize       = 100
+	maxBodyKB      = 1024
+	maxPollOptions = 12 // WhatsApp's limit
 )
 
 type scope int
@@ -37,6 +39,8 @@ type Health struct {
 // WhatsApp is the part of the whatsmeow client the API needs.
 type WhatsApp interface {
 	SendText(ctx context.Context, to, text string) (messageID string, err error)
+	// SendPoll returns the poll's message id and the chat JID it went to (needed to match votes).
+	SendPoll(ctx context.Context, to, question string, options []string, selectable int) (messageID, chatJID string, err error)
 	Health() Health
 }
 
@@ -50,10 +54,11 @@ type Server struct {
 	cfg Config
 	wa  WhatsApp
 	q   *queue.Store
+	p   *polls.Store
 	mux *http.ServeMux
 }
 
-func New(cfg Config, wa WhatsApp, q *queue.Store) (*Server, error) {
+func New(cfg Config, wa WhatsApp, q *queue.Store, p *polls.Store) (*Server, error) {
 	switch {
 	case cfg.BridgeToken == "" || cfg.NotifyToken == "":
 		return nil, errors.New("TOKEN_BRIDGE and TOKEN_NOTIFY are required")
@@ -62,11 +67,12 @@ func New(cfg Config, wa WhatsApp, q *queue.Store) (*Server, error) {
 	case cfg.OwnerPhone == "":
 		return nil, errors.New("OWNER_PHONE is required")
 	}
-	s := &Server{cfg: cfg, wa: wa, q: q, mux: http.NewServeMux()}
+	s := &Server{cfg: cfg, wa: wa, q: q, p: p, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /v1/health", s.health)
 	s.mux.Handle("GET /v1/events", s.require(scopeBridge, s.listEvents))
 	s.mux.Handle("POST /v1/events/ack", s.require(scopeBridge, s.ackEvents))
 	s.mux.Handle("POST /v1/messages", s.require(scopeNotify, s.sendMessage))
+	s.mux.Handle("POST /v1/polls", s.require(scopeBridge, s.sendPoll))
 	return s, nil
 }
 
@@ -169,6 +175,56 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"message_id": id})
+}
+
+func (s *Server) sendPoll(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		To         string   `json:"to"`
+		Question   string   `json:"question"`
+		Options    []string `json:"options"`
+		Selectable int      `json:"selectable"` // how many options a voter may pick; 0 or absent = 1
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON")
+		return
+	}
+	if msg := validatePoll(req.To, req.Question, req.Options, req.Selectable); msg != "" {
+		writeError(w, http.StatusBadRequest, msg)
+		return
+	}
+	selectable := max(req.Selectable, 1)
+	id, chat, err := s.wa.SendPoll(r.Context(), req.To, req.Question, req.Options, selectable)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "WhatsApp send failed: "+err.Error())
+		return
+	}
+	if err := s.p.Save(id, chat, req.Options); err != nil {
+		// The poll is out, but its votes cannot be read back. Say so instead of pretending it worked.
+		writeError(w, http.StatusInternalServerError, "poll sent ("+id+") but its options could not be saved; votes will be ignored")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message_id": id})
+}
+
+func validatePoll(to, question string, options []string, selectable int) string {
+	switch {
+	case to == "":
+		return "to is required"
+	case strings.TrimSpace(question) == "":
+		return "question is required"
+	case len(options) < 2 || len(options) > maxPollOptions:
+		return "options must have 2 to 12 items"
+	case selectable < 0 || selectable > len(options):
+		return "selectable must be between 1 and the number of options"
+	}
+	seen := map[string]bool{}
+	for _, o := range options {
+		if strings.TrimSpace(o) == "" || seen[o] {
+			return "options must be non-empty and different from each other"
+		}
+		seen[o] = true
+	}
+	return ""
 }
 
 func intParam(r *http.Request, name string) (int64, error) {
