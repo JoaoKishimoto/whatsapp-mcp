@@ -29,6 +29,9 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+	"whatsapp-client/internal/api"
+	"whatsapp-client/internal/queue"
+	"whatsapp-client/internal/wa"
 )
 
 // Message represents a chat message for our client
@@ -408,11 +411,66 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	return "", "", "", nil, nil, nil, 0
 }
 
+// withPN fills the phone number from whatsmeow's LID→phone map when WhatsApp
+// sent only the LID (LID addressing).
+func withPN(client *whatsmeow.Client, p wa.Person) wa.Person {
+	if p.PN == "" && p.LID != "" {
+		lid, _ := types.ParseJID(p.LID)
+		if pn, err := client.Store.LIDs.GetPNForLID(context.Background(), lid); err == nil && !pn.IsEmpty() {
+			p.PN = pn.User
+		}
+	}
+	return p
+}
+
+// senderID prefers the phone number, then the LID.
+func senderID(client *whatsmeow.Client, src types.MessageSource) string {
+	p := withPN(client, wa.SenderOf(src))
+	if p.PN != "" {
+		return p.PN
+	}
+	if p.LID != "" {
+		return p.LID
+	}
+	return src.Sender.User
+}
+
+// waClient adapts whatsmeow to api.WhatsApp.
+type waClient struct{ c *whatsmeow.Client }
+
+func (w waClient) SendText(ctx context.Context, to, text string) (string, error) {
+	jid, err := types.ParseJID(to)
+	if !strings.Contains(to, "@") {
+		jid, err = types.NewJID(to, types.DefaultUserServer), nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("invalid recipient: %w", err)
+	}
+	resp, err := w.c.SendMessage(ctx, jid, &waProto.Message{Conversation: proto.String(text)})
+	return resp.ID, err
+}
+
+func (w waClient) Health() api.Health {
+	return api.Health{Connected: w.c.IsConnected(), LoggedIn: w.c.IsLoggedIn()}
+}
+
+// queueMessage puts a live message on the bridge's event queue.
+func queueMessage(client *whatsmeow.Client, q *queue.Store, evt *events.Message, logger waLog.Logger) {
+	msg, ok := wa.Normalize(evt)
+	if !ok {
+		return
+	}
+	msg.Sender = withPN(client, msg.Sender)
+	if _, err := q.Append("message", msg); err != nil {
+		logger.Errorf("Failed to queue message %s: %v", msg.MessageID, err)
+	}
+}
+
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
-	sender := msg.Info.Sender.User
+	sender := senderID(client, msg.Info.MessageSource)
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
@@ -640,8 +698,10 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		MediaType:     waMediaType,
 	}
 
-	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	// Download the media using whatsmeow client (its media HTTP client has no timeout of its own)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	mediaData, err := client.Download(ctx, downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -676,9 +736,12 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
-	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, apiServer *api.Server, port int) {
+	mux := http.NewServeMux()
+	mux.Handle("/v1/", apiServer)
+
+	// Handler for sending messages (upstream route; can send any file on disk, so bridge token only)
+	mux.Handle("/api/send", apiServer.BridgeOnly(func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -721,10 +784,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Success: success,
 			Message: message,
 		})
-	})
+	}))
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/download", apiServer.BridgeOnly(func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -772,7 +835,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Filename: filename,
 			Path:     path,
 		})
-	})
+	}))
 
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
@@ -780,7 +843,13 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		server := &http.Server{
+			Addr:              serverAddr,
+			Handler:           mux,
+			ReadHeaderTimeout: 10 * time.Second,
+			WriteTimeout:      3 * time.Minute, // above the 25 s long-poll and the 2 min media download
+		}
+		if err := server.ListenAndServe(); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
@@ -800,14 +869,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -826,6 +895,30 @@ func main() {
 		return
 	}
 
+	// Event queue and API; fail before connecting if tokens are missing
+	eventQueue, err := queue.Open("store/events.db")
+	if err != nil {
+		logger.Errorf("Failed to open event queue: %v", err)
+		return
+	}
+	defer eventQueue.Close()
+	apiServer, err := api.New(api.Config{
+		BridgeToken: os.Getenv("TOKEN_BRIDGE"),
+		NotifyToken: os.Getenv("TOKEN_NOTIFY"),
+		OwnerPhone:  os.Getenv("OWNER_PHONE"),
+	}, waClient{client}, eventQueue)
+	if err != nil {
+		logger.Errorf("Invalid API config: %v", err)
+		return
+	}
+	go func() {
+		for range time.Tick(time.Hour) {
+			if _, err := eventQueue.Cleanup(); err != nil {
+				logger.Warnf("Event queue cleanup failed: %v", err)
+			}
+		}
+	}()
+
 	// Initialize message store
 	messageStore, err := NewMessageStore()
 	if err != nil {
@@ -840,6 +933,7 @@ func main() {
 		case *events.Message:
 			// Process regular messages
 			handleMessage(client, messageStore, v, logger)
+			queueMessage(client, eventQueue, v, logger)
 
 		case *events.HistorySync:
 			// Process history sync events
@@ -906,7 +1000,7 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	startRESTServer(client, messageStore, apiServer, 8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -973,7 +1067,10 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			// Runs inside the event handler, which whatsmeow calls one event at a time
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			groupInfo, err := client.GetGroupInfo(ctx, jid)
+			cancel()
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1085,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
