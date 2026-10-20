@@ -45,6 +45,7 @@ type WhatsApp interface {
 	SendPoll(ctx context.Context, to, question string, options []string, selectable int) (messageID, chatJID string, err error)
 	Health() Health
 	Groups
+	Chat
 }
 
 type Config struct {
@@ -77,6 +78,7 @@ func New(cfg Config, wa WhatsApp, q *queue.Store, p *polls.Store) (*Server, erro
 	s.mux.Handle("POST /v1/messages", s.require(scopeNotify, s.sendMessage))
 	s.mux.Handle("POST /v1/polls", s.require(scopeBridge, s.sendPoll))
 	s.routeGroups()
+	s.routeChat()
 	return s, nil
 }
 

@@ -192,7 +192,7 @@ func parsePeople(w http.ResponseWriter, in []string) ([]types.JID, bool) {
 	out := make([]types.JID, 0, len(in))
 	for _, s := range in {
 		jid, err := wa.ParseRecipient(s)
-		if err == nil && jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer {
+		if err == nil && !isUser(jid) {
 			err = errors.New("must be a phone number or a user JID")
 		}
 		if err != nil {

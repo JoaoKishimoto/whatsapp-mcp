@@ -19,13 +19,13 @@ const (
 	topicJID     = "120363000000000001@g.us"
 )
 
-type groupCall struct {
+type call struct {
 	method string
 	args   string
 }
 
 func (f *fakeWA) record(method string, args ...any) error {
-	f.groups = append(f.groups, groupCall{method, fmt.Sprint(args...)})
+	f.calls = append(f.calls, call{method, fmt.Sprint(args...)})
 	if f.err != nil {
 		return f.err
 	}
@@ -82,8 +82,8 @@ func TestGroupRoutesNeedBridgeToken(t *testing.T) {
 			t.Errorf("%s %s without token: got %d", rt[0], rt[1], w.Code)
 		}
 	}
-	if len(wa.groups) != 0 {
-		t.Errorf("WhatsApp was called: %v", wa.groups)
+	if len(wa.calls) != 0 {
+		t.Errorf("WhatsApp was called: %v", wa.calls)
 	}
 }
 
@@ -104,7 +104,7 @@ func TestCreateCommunityAndLinkedGroup(t *testing.T) {
 		"create" + fmt.Sprint("🥗 Dieta", " ", "", " ", []types.JID{types.NewJID("5571999999999", types.DefaultUserServer)},
 			" parent=", types.NewJID("120363000000000009", types.GroupServer), " community=", false),
 	}
-	for i, c := range f.groups {
+	for i, c := range f.calls {
 		if c.method+c.args != want[i] {
 			t.Errorf("call %d = %s%s\nwant %s", i, c.method, c.args, want[i])
 		}
@@ -126,8 +126,8 @@ func TestCreateGroupValidation(t *testing.T) {
 			t.Errorf("%s: got %d", body, w.Code)
 		}
 	}
-	if len(f.groups) != 0 {
-		t.Errorf("WhatsApp was called: %v", f.groups)
+	if len(f.calls) != 0 {
+		t.Errorf("WhatsApp was called: %v", f.calls)
 	}
 }
 
@@ -157,8 +157,8 @@ func TestParticipants(t *testing.T) {
 			t.Errorf("%s: got %d", body, w.Code)
 		}
 	}
-	if len(f.groups) != 1 {
-		t.Errorf("calls = %v", f.groups)
+	if len(f.calls) != 1 {
+		t.Errorf("calls = %v", f.calls)
 	}
 }
 
@@ -181,14 +181,14 @@ func TestInviteLinkUnlinkLeave(t *testing.T) {
 		t.Errorf("leave: %d", w.Code)
 	}
 	got := []string{}
-	for _, c := range f.groups {
+	for _, c := range f.calls {
 		got = append(got, c.method)
 	}
 	if strings.Join(got, ",") != "invite,link,unlink,leave" {
 		t.Errorf("calls = %v", got)
 	}
-	if !strings.Contains(f.groups[0].args, "reset=true") {
-		t.Errorf("reset not passed: %s", f.groups[0].args)
+	if !strings.Contains(f.calls[0].args, "reset=true") {
+		t.Errorf("reset not passed: %s", f.calls[0].args)
 	}
 }
 

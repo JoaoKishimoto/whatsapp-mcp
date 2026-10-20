@@ -5,6 +5,7 @@
 #   (set -a; . ./.env; set +a; bash a0-check.sh poll 1203…@g.us)   # same, inside a group
 #   (set -a; . ./.env; set +a; bash a0-check.sh groups) # creates a test community + topic group with you as admin
 #   (set -a; . ./.env; set +a; bash a0-check.sh groups 1203…@g.us)  # reuses that community, creates only the topic group
+#   (set -a; . ./.env; set +a; bash a0-check.sh g8)     # typing, 👀 reaction and read receipt on your latest DM and group message
 # A 429 (rate-overlimit) means WhatsApp is limiting this number: wait hours, do not retry in a loop.
 # Reads TOKEN_BRIDGE, TOKEN_NOTIFY and OWNER_PHONE from the environment and never prints the tokens.
 # Read-only on the queue: it does not ack events, so you can run it again.
@@ -18,7 +19,8 @@ BASE="${GATEWAY_URL:-http://localhost:8080}"
 pass=0
 fail=0
 body=$(mktemp)
-trap 'rm -f "$body"' EXIT
+events=$(mktemp)
+trap 'rm -f "$body" "$events"' EXIT
 
 # call METHOD PATH TOKEN [JSON] -> prints the HTTP status (000 if unreachable); response body goes to $body
 call() {
@@ -26,6 +28,23 @@ call() {
 	[ -n "$3" ] && args+=(-H "Authorization: Bearer $3")
 	[ $# -ge 4 ] && args+=(-H 'Content-Type: application/json' --data "$4")
 	curl "${args[@]}" 2>/dev/null
+}
+
+# all_events -> every queued event, all pages (the API returns 100 at a time), as one JSON array in $events
+all_events() {
+	local after=0
+	echo '[]' >"$events"
+	while :; do
+		[ "$(call GET "/v1/events?after=$after" "$TOKEN_BRIDGE")" = 200 ] || return 1
+		after=$(python3 - "$events" "$body" <<'PY'
+import json, sys
+acc, page = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
+json.dump(acc + page, open(sys.argv[1], "w"))
+print(page[-1]["id"] if page else "")
+PY
+)
+		[ -n "$after" ] || return 0
+	done
 }
 
 # check NAME EXPECTED_STATUS GOT_STATUS
@@ -116,9 +135,47 @@ if [ "${1:-}" = "groups" ]; then
 	fi
 fi
 
-echo "== 4. Receiving (messages sent to the bot since the gateway started)"
+if [ "${1:-}" = "g8" ]; then
+	echo "== 3d. Typing, reaction and read receipt (G8)"
+	all_events || echo "FAIL  could not read events"
+	# One line per target, from the queue: kind chat message_id sender ("-" in a DM, where the chat is the sender).
+	# In a group the sender goes as its LID when known: that is how WhatsApp addresses group messages now.
+	targets=$(python3 - "$events" <<'PY'
+import json, sys
+latest = {}
+for e in json.load(open(sys.argv[1])):
+    d = e["data"]
+    if e["type"] == "message" and not d.get("is_from_me") and d.get("chat_kind") in ("dm", "group"):
+        latest[d["chat_kind"]] = d
+for kind in ("dm", "group"):
+    if kind in latest:
+        d, s = latest[kind], latest[kind].get("sender", {})
+        sender = "-" if kind == "dm" else (s.get("lid") or s.get("pn") or "-")
+        print(kind, d["chat_jid"], d["message_id"], sender)
+PY
+)
+	[ -n "$targets" ] || echo "      (no message from you yet: message the bot, then run again)"
+	while read -r kind chat id sender; do
+		[ -n "$kind" ] || continue
+		with_sender=""
+		[ "$sender" != "-" ] && with_sender=",\"sender\":\"$sender\""
+		echo "      -> look at your $kind with the bot now: 'digitando…' for 5 s"
+		check "typing in your $kind" 204 "$(call POST /v1/presence "$TOKEN_BRIDGE" "{\"chat\":\"$chat\",\"state\":\"composing\"}")"
+		sleep 5
+		check "stop typing in your $kind" 204 "$(call POST /v1/presence "$TOKEN_BRIDGE" "{\"chat\":\"$chat\",\"state\":\"paused\"}")"
+		check "react 👀 to your last $kind message" 200 \
+			"$(call POST /v1/reactions "$TOKEN_BRIDGE" "{\"chat\":\"$chat\",\"message_id\":\"$id\",\"emoji\":\"👀\"$with_sender}")"
+		check "mark it read" 204 \
+			"$(call POST /v1/read "$TOKEN_BRIDGE" "{\"chat\":\"$chat\",\"message_ids\":[\"$id\"]$with_sender}")"
+	done <<<"$targets"
+	echo "      -> on your phone: your last message in each chat has 👀 and blue ticks"
+	echo "         (blue ticks need read receipts on, for you and for the bot)"
+fi
+
+echo "== 4. Receiving (events queued since the gateway started)"
 check "bridge token reads events" 200 "$(call GET '/v1/events?after=0' "$TOKEN_BRIDGE")"
-python3 - "$body" "$OWNER_PHONE" <<'PY'
+all_events || echo "FAIL  could not read every page of events"
+python3 - "$events" "$OWNER_PHONE" <<'PY'
 import json, sys
 
 try:
@@ -140,6 +197,9 @@ for e in events:
     if e["type"] == "group_joined":
         by = d.get("added_by") or {}
         print(f"      #{e['id']} group_joined  {d.get('kind')} {d.get('name')!r} jid={d.get('jid')} parent={d.get('parent_jid', '-')} added_by pn={by.get('pn', '-')}")
+        continue
+    if e["type"] == "connection":
+        print(f"      #{e['id']} connection  {d.get('state')}  {d.get('reason', '')}")
         continue
     s = d.get("sender", {})
     print(f"      #{e['id']} {e['type']}  chat={d.get('chat_kind')}  parent={d.get('group_parent_jid', '-')}  from_me={d.get('is_from_me')}  edit_of={d.get('edit_of', '-')}")
@@ -170,6 +230,7 @@ print(f"        with a LID: {any('lid' in m.get('sender', {}) for m in in_groups
 print(f"        with the community as parent: {any('group_parent_jid' in m for m in in_groups)}")
 print(f"        a quote was read: {any('quoted' in m for m in in_groups)}")
 print(f"      poll votes in a group: {sum(v.get('chat_jid', '').endswith('@g.us') for v in votes)}")
+print(f"      connection events (last 5): {[e['data']['state'] for e in events if e['type'] == 'connection'][-5:]}")
 PY
 
 echo "== Result: $pass passed, $fail failed"

@@ -29,11 +29,11 @@ type sentPoll struct {
 }
 
 type fakeWA struct {
-	sent   []sent
-	polls  []sentPoll
-	groups []groupCall // group methods are in groups_test.go
-	fail   bool
-	err    error // returned by group methods when set
+	sent  []sent
+	polls []sentPoll
+	calls []call // group and chat methods record here (groups_test.go, chat_test.go)
+	fail  bool
+	err   error // returned by group methods when set
 }
 
 func (f *fakeWA) SendPoll(_ context.Context, to, question string, options []string, selectable int) (string, string, error) {

@@ -292,8 +292,6 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			return false, fmt.Sprintf("Error uploading media: %v", err)
 		}
 
-		fmt.Println("Media uploaded", resp)
-
 		// Create the appropriate message type based on media type
 		switch mediaType {
 		case whatsmeow.MediaImage:
@@ -557,22 +555,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileLength,
 	)
 
+	// Logs never carry message content, names or file names (PLANO.md §9).
 	if err != nil {
-		logger.Warnf("Failed to store message: %v", err)
-	} else {
-		// Log message reception
-		timestamp := msg.Info.Timestamp.Format("2006-01-02 15:04:05")
-		direction := "←"
-		if msg.Info.IsFromMe {
-			direction = "→"
-		}
-
-		// Log based on message type
-		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
-		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
-		}
+		logger.Warnf("Failed to store message %s: %v", msg.Info.ID, err)
 	}
 }
 
@@ -716,8 +701,6 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("incomplete media information for download")
 	}
 
-	fmt.Printf("Attempting to download media for message %s in chat %s...\n", messageID, chatJID)
-
 	// Extract direct path from URL
 	directPath := extractDirectPathFromURL(url)
 
@@ -759,7 +742,6 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
 	}
 
-	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
 	return true, mediaType, filename, absPath, nil
 }
 
@@ -814,11 +796,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, apiSe
 			return
 		}
 
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
-
 		// Send the message
 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
-		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
@@ -987,6 +966,16 @@ func main() {
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
+		if c, ok := wa.ConnectionOf(evt); ok {
+			if c.Fatal() {
+				logger.Errorf("WhatsApp connection: %s (needs a person: re-pair, update or restart) %s", c.State, c.Reason)
+			} else {
+				logger.Infof("WhatsApp connection: %s", c.State)
+			}
+			if _, err := eventQueue.Append("connection", c); err != nil {
+				logger.Errorf("Failed to queue connection %s: %v", c.State, err)
+			}
+		}
 		switch v := evt.(type) {
 		case *events.Message:
 			if v.Message.GetPollUpdateMessage() != nil {
@@ -1010,11 +999,16 @@ func main() {
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
 
-		case *events.Connected:
-			logger.Infof("Connected to WhatsApp")
-
-		case *events.LoggedOut:
-			logger.Warnf("Device logged out, please scan QR code to log in again")
+		case *events.Connected, *events.PushNameSetting:
+			// Online, like an open WhatsApp Web: "typing…" and blue ticks only show while online.
+			// Side effect: the bot's phone gets no notifications for its chats meanwhile.
+			if client.Store.PushName != "" {
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				if err := client.SendPresence(ctx, types.PresenceAvailable); err != nil {
+					logger.Warnf("Failed to mark the bot online: %v", err)
+				}
+				cancel()
+			}
 		}
 	})
 
@@ -1094,7 +1088,6 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 	err := messageStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", chatJID).Scan(&existingName)
 	if err == nil && existingName != "" {
 		// Chat exists with a name, use that
-		logger.Infof("Using existing chat name for %s: %s", chatJID, existingName)
 		return existingName
 	}
 
@@ -1103,8 +1096,6 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 	if jid.Server == "g.us" {
 		// This is a group chat
-		logger.Infof("Getting name for group: %s", chatJID)
-
 		// Use conversation data if provided (from history sync)
 		if conversation != nil {
 			// Extract name from conversation if available
@@ -1150,11 +1141,8 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 			}
 		}
 
-		logger.Infof("Using group name: %s", name)
 	} else {
 		// This is an individual contact
-		logger.Infof("Getting name for contact: %s", chatJID)
-
 		// Just use contact info (full name)
 		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
@@ -1166,8 +1154,6 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 			// Last fallback to JID
 			name = jid.User
 		}
-
-		logger.Infof("Using contact name: %s", name)
 	}
 
 	return name
@@ -1240,9 +1226,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
 				}
 
-				// Log the message content for debugging
-				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
-
 				// Skip messages with no content and no media
 				if content == "" && mediaType == "" {
 					continue
@@ -1299,14 +1282,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					logger.Warnf("Failed to store history message: %v", err)
 				} else {
 					syncedCount++
-					// Log successful message storage
-					if mediaType != "" {
-						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
-					} else {
-						logger.Infof("Stored message: [%s] %s -> %s: %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
-					}
 				}
 			}
 		}
