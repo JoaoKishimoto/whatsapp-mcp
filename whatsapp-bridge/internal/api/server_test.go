@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	"go.mau.fi/whatsmeow/types"
+
 	"whatsapp-client/internal/polls"
 	"whatsapp-client/internal/queue"
 )
@@ -20,7 +22,10 @@ const (
 	owner     = "5571999999999"
 )
 
-type sent struct{ to, text string }
+type sent struct {
+	to, text string
+	reply    *Reply
+}
 
 type sentPoll struct {
 	to, question string
@@ -44,11 +49,11 @@ func (f *fakeWA) SendPoll(_ context.Context, to, question string, options []stri
 	return "3EB0POLL", to + "@s.whatsapp.net", nil
 }
 
-func (f *fakeWA) SendText(_ context.Context, to, text string) (string, error) {
+func (f *fakeWA) SendText(_ context.Context, to types.JID, text string, reply *Reply) (string, error) {
 	if f.fail {
 		return "", errors.New("not connected")
 	}
-	f.sent = append(f.sent, sent{to, text})
+	f.sent = append(f.sent, sent{to.User, text, reply})
 	return "3EB0SENT", nil
 }
 
@@ -72,7 +77,7 @@ func setupWithPolls(t *testing.T) (*Server, *fakeWA, *queue.Store, *polls.Store)
 	}
 	t.Cleanup(func() { p.Close() })
 	wa := &fakeWA{}
-	s, err := New(Config{BridgeToken: bridgeTok, NotifyToken: notifyTok, OwnerPhone: owner}, wa, q, p)
+	s, err := New(Config{BridgeToken: bridgeTok, NotifyToken: notifyTok, OwnerPhone: owner, MediaDir: t.TempDir()}, wa, q, p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,6 +100,7 @@ func TestNewRefusesBadConfig(t *testing.T) {
 		{BridgeToken: "b", OwnerPhone: owner},
 		{BridgeToken: "same", NotifyToken: "same", OwnerPhone: owner},
 		{BridgeToken: "b", NotifyToken: "n"},
+		{BridgeToken: "b", NotifyToken: "n", OwnerPhone: owner}, // no media directory
 	} {
 		if _, err := New(cfg, &fakeWA{}, nil, nil); err == nil {
 			t.Errorf("accepted %+v", cfg)

@@ -114,6 +114,21 @@ func TestImageWithoutCaption(t *testing.T) {
 	}
 }
 
+func TestVoiceNote(t *testing.T) {
+	m := &waE2E.Message{AudioMessage: &waE2E.AudioMessage{Mimetype: proto.String("audio/ogg; codecs=opus"), PTT: proto.Bool(true), Seconds: proto.Uint32(7)}}
+	msg, ok := Normalize(event(types.MessageSource{Chat: phone, Sender: phone}, m))
+	if !ok || msg.Attachment == nil || msg.Attachment.Kind != "audio" || !msg.Attachment.PTT {
+		t.Errorf("got %+v attachment=%+v ok=%v", msg, msg.Attachment, ok)
+	}
+}
+
+func TestQuoteContext(t *testing.T) {
+	ci := QuoteContext("3EB0Q", types.NewJID("5571999999999", types.DefaultUserServer), "")
+	if ci.GetStanzaID() != "3EB0Q" || ci.GetParticipant() != "5571999999999@s.whatsapp.net" || ci.QuotedMessage != nil {
+		t.Errorf("got %v", ci)
+	}
+}
+
 func TestEdit(t *testing.T) {
 	m := &waE2E.Message{ProtocolMessage: &waE2E.ProtocolMessage{
 		Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),

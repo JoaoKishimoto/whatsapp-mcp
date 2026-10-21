@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
@@ -47,6 +48,56 @@ func TestHealth(t *testing.T) {
 	}
 	if health([]string{"http://127.0.0.1:1/v1/health"}) == nil {
 		t.Error("unreachable gateway reported healthy")
+	}
+}
+
+func TestRetentionFromEnv(t *testing.T) {
+	t.Setenv("MESSAGE_RETENTION_DAYS", "")
+	if d, err := retentionFromEnv(); err != nil || d != 7*24*time.Hour {
+		t.Errorf("default = %v %v", d, err)
+	}
+	t.Setenv("MESSAGE_RETENTION_DAYS", "3")
+	if d, _ := retentionFromEnv(); d != 3*24*time.Hour {
+		t.Errorf("3 days = %v", d)
+	}
+	for _, bad := range []string{"0", "-1", "7d", "x"} {
+		t.Setenv("MESSAGE_RETENTION_DAYS", bad)
+		if _, err := retentionFromEnv(); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}
+
+// G11: old content goes, whichever driver wrote the timestamp; chats left empty go too.
+func TestMessageRetention(t *testing.T) {
+	old := storeDir
+	storeDir = t.TempDir()
+	t.Cleanup(func() { storeDir = old })
+	ms, err := NewMessageStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ms.Close()
+	now := time.Now()
+	ms.StoreChat("a@s.whatsapp.net", "A", now)
+	ms.StoreChat("b@s.whatsapp.net", "B", now)
+	ms.StoreMessage("new", "a@s.whatsapp.net", "a", "fresh", now.Add(-time.Hour), false, "", "", "", nil, nil, nil, 0)
+	ms.StoreMessage("old", "a@s.whatsapp.net", "a", "stale", now.Add(-8*24*time.Hour), false, "", "", "", nil, nil, nil, 0)
+	// As mattn/go-sqlite3 wrote it before G12, with a UTC offset.
+	_, err = ms.db.Exec(`INSERT INTO messages (id, chat_jid, sender, content, timestamp, is_from_me) VALUES (?, ?, ?, ?, ?, ?)`,
+		"mattn", "b@s.whatsapp.net", "b", "stale", now.Add(-9*24*time.Hour).Format("2006-01-02 15:04:05.999999999-07:00"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err := ms.DeleteOlderThan(now.Add(-7 * 24 * time.Hour))
+	if err != nil || n != 2 {
+		t.Fatalf("deleted %d, %v; want 2", n, err)
+	}
+	var left, chats int
+	ms.db.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&left)
+	ms.db.QueryRow(`SELECT COUNT(*) FROM chats`).Scan(&chats)
+	if left != 1 || chats != 1 {
+		t.Errorf("left %d messages and %d chats, want 1 and 1", left, chats)
 	}
 }
 

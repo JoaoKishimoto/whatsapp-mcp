@@ -14,6 +14,7 @@ services:
     env_file: .env # TOKEN_BRIDGE, TOKEN_NOTIFY, OWNER_PHONE: copy .env.example
     volumes:
       - wa-store:/data # whatsapp.db holds the bot's session keys: back it up encrypted only
+      - wa-media:/media # attachments in and out; the bridge mounts the same volume
     networks: [proxy]
     user: "65532:65532"
     read_only: true
@@ -38,6 +39,8 @@ services:
 
 volumes:
   wa-store:
+  wa-media:
+    name: wa-media # fixed name, so the bridge's compose project can use it as external
 
 networks:
   proxy:

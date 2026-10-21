@@ -24,10 +24,32 @@ type Chat interface {
 	MarkRead(ctx context.Context, chat, sender types.JID, messageIDs []string) error
 }
 
+// Calls lets the bridge reject a call it was told about by a "call" event.
+type Calls interface {
+	RejectCall(ctx context.Context, from types.JID, callID string) error
+}
+
 func (s *Server) routeChat() {
 	s.mux.Handle("POST /v1/presence", s.require(scopeBridge, s.presence))
 	s.mux.Handle("POST /v1/reactions", s.require(scopeBridge, s.react))
 	s.mux.Handle("POST /v1/read", s.require(scopeBridge, s.markRead))
+	s.mux.Handle("POST /v1/calls/reject", s.require(scopeBridge, s.rejectCall))
+}
+
+func (s *Server) rejectCall(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		From   string `json:"from"` // from_jid of the call event
+		CallID string `json:"call_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.CallID) == "" {
+		writeError(w, http.StatusBadRequest, "from and call_id are required")
+		return
+	}
+	people, ok := parsePeople(w, []string{req.From})
+	if !ok {
+		return
+	}
+	s.noContent(w, s.wa.RejectCall(r.Context(), people[0], req.CallID), "call reject")
 }
 
 func (s *Server) presence(w http.ResponseWriter, r *http.Request) {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/types"
 
 	"whatsapp-client/internal/polls"
 	"whatsapp-client/internal/queue"
@@ -40,18 +41,21 @@ type Health struct {
 
 // WhatsApp is the part of the whatsmeow client the API needs.
 type WhatsApp interface {
-	SendText(ctx context.Context, to, text string) (messageID string, err error)
+	SendText(ctx context.Context, to types.JID, text string, reply *Reply) (messageID string, err error)
 	// SendPoll returns the poll's message id and the chat JID it went to (needed to match votes).
 	SendPoll(ctx context.Context, to, question string, options []string, selectable int) (messageID, chatJID string, err error)
 	Health() Health
 	Groups
 	Chat
+	Media
+	Calls
 }
 
 type Config struct {
 	BridgeToken string
 	NotifyToken string
 	OwnerPhone  string // digits only; the only destination for the notify token
+	MediaDir    string // shared volume: downloads land here, files are sent only from here
 }
 
 type Server struct {
@@ -70,6 +74,8 @@ func New(cfg Config, wa WhatsApp, q *queue.Store, p *polls.Store) (*Server, erro
 		return nil, errors.New("TOKEN_BRIDGE and TOKEN_NOTIFY must differ")
 	case cfg.OwnerPhone == "":
 		return nil, errors.New("OWNER_PHONE is required")
+	case cfg.MediaDir == "":
+		return nil, errors.New("a media directory is required")
 	}
 	s := &Server{cfg: cfg, wa: wa, q: q, p: p, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /v1/health", s.health)
@@ -79,6 +85,7 @@ func New(cfg Config, wa WhatsApp, q *queue.Store, p *polls.Store) (*Server, erro
 	s.mux.Handle("POST /v1/polls", s.require(scopeBridge, s.sendPoll))
 	s.routeGroups()
 	s.routeChat()
+	s.routeMedia()
 	return s, nil
 }
 
@@ -161,8 +168,9 @@ func (s *Server) ackEvents(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		To   string `json:"to"`
-		Text string `json:"text"`
+		To      string    `json:"to"`
+		Text    string    `json:"text"`
+		ReplyTo *replyReq `json:"reply_to"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Text) == "" {
 		writeError(w, http.StatusBadRequest, "text is required")
@@ -171,11 +179,16 @@ func (s *Server) sendMessage(w http.ResponseWriter, r *http.Request) {
 	if r.Context().Value(ctxKey{}) == scopeNotify {
 		req.To = s.cfg.OwnerPhone // notify can only reach the owner; any "to" is ignored
 	}
-	if req.To == "" {
-		writeError(w, http.StatusBadRequest, "to is required")
+	to, err := parseChat(req.To)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "to: "+err.Error())
 		return
 	}
-	id, err := s.wa.SendText(r.Context(), req.To, req.Text)
+	reply, ok := parseReply(w, to, req.ReplyTo)
+	if !ok {
+		return
+	}
+	id, err := s.wa.SendText(r.Context(), to, req.Text, reply)
 	if err != nil {
 		waFailed(w, "send", err)
 		return

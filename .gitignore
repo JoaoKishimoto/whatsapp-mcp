@@ -5,3 +5,4 @@ whatsapp-bridge/whatsapp-client
 .env
 whatsapp-bridge/store/
 whatsapp-bridge/wa-gateway
+whatsapp-bridge/media/

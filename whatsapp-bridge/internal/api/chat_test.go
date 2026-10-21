@@ -21,9 +21,28 @@ func (f *fakeWA) MarkRead(_ context.Context, chat, sender types.JID, ids []strin
 	return f.record("read", chat, " ", sender, " ", ids)
 }
 
+func (f *fakeWA) RejectCall(_ context.Context, from types.JID, callID string) error {
+	return f.record("reject", from, " ", callID)
+}
+
+func TestRejectCall(t *testing.T) {
+	s, f, _ := setup(t)
+	if w := do(s, "POST", "/v1/calls/reject", bridgeTok, `{"from":"123456789@lid","call_id":"CALL1"}`); w.Code != 204 {
+		t.Fatalf("got %d %s", w.Code, w.Body)
+	}
+	if f.calls[0].args != "123456789@lid CALL1" {
+		t.Errorf("args = %q", f.calls[0].args)
+	}
+	for _, body := range []string{`{"from":"123456789@lid"}`, `{"from":"` + topicJID + `","call_id":"C"}`, `{"call_id":"C"}`} {
+		if w := do(s, "POST", "/v1/calls/reject", bridgeTok, body); w.Code != 400 {
+			t.Errorf("%s: got %d", body, w.Code)
+		}
+	}
+}
+
 func TestChatRoutesNeedBridgeToken(t *testing.T) {
 	s, wa, _ := setup(t)
-	for _, path := range []string{"/v1/presence", "/v1/reactions", "/v1/read"} {
+	for _, path := range []string{"/v1/presence", "/v1/reactions", "/v1/read", "/v1/calls/reject"} {
 		if w := do(s, "POST", path, notifyTok, `{}`); w.Code != 403 {
 			t.Errorf("%s with notify token: got %d", path, w.Code)
 		}

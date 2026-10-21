@@ -28,6 +28,7 @@ type Attachment struct {
 	MIME     string `json:"mime,omitempty"`
 	Filename string `json:"filename,omitempty"`
 	Size     uint64 `json:"size,omitempty"`
+	PTT      bool   `json:"ptt,omitempty"` // a voice note (audio recorded in the chat)
 }
 
 type Message struct {
@@ -148,7 +149,7 @@ func attachmentOf(m *waE2E.Message) *Attachment {
 		return &Attachment{Kind: "video", MIME: x.GetMimetype(), Size: x.GetFileLength()}
 	case m.GetAudioMessage() != nil:
 		x := m.GetAudioMessage()
-		return &Attachment{Kind: "audio", MIME: x.GetMimetype(), Size: x.GetFileLength()}
+		return &Attachment{Kind: "audio", MIME: x.GetMimetype(), Size: x.GetFileLength(), PTT: x.GetPTT()}
 	case m.GetDocumentMessage() != nil:
 		x := m.GetDocumentMessage()
 		return &Attachment{Kind: "document", MIME: x.GetMimetype(), Filename: x.GetFileName(), Size: x.GetFileLength()}

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,8 +33,11 @@ const usage = `usage: wa-gateway [serve | pair [--phone <bot number>] | health [
 
 The data directory is STORE_DIR (default ./store). whatsapp.db in it holds the session keys.`
 
-// storeDir holds whatsapp.db (the session keys), messages.db, events.db and polls.db.
+// storeDir holds whatsapp.db (the session keys), messages.db, events.db, polls.db and media.db.
 var storeDir = "store"
+
+// mediaDir is the volume shared with the bridge: downloads land here, files are sent only from here.
+var mediaDir = "media"
 
 func storePath(name string) string { return filepath.Join(storeDir, name) }
 
@@ -44,6 +48,13 @@ func main() {
 	logger := waLog.Stdout("Client", "INFO", useColor)
 	if dir := os.Getenv("STORE_DIR"); dir != "" {
 		storeDir = dir
+	}
+	if dir := os.Getenv("MEDIA_DIR"); dir != "" {
+		mediaDir = dir
+	}
+	// Absolute, so a path returned by /v1/media/download can be sent back as is.
+	if dir, err := filepath.Abs(mediaDir); err == nil {
+		mediaDir = dir
 	}
 	cmd, args := "serve", os.Args[1:]
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -164,6 +175,20 @@ func pair(logger waLog.Logger, args []string) error {
 		}
 	}
 	return errors.New("pairing ended without success")
+}
+
+// retentionFromEnv reads MESSAGE_RETENTION_DAYS (default 7): how long message content,
+// attachment keys and downloaded files are kept (G11).
+func retentionFromEnv() (time.Duration, error) {
+	days := 7
+	if v := os.Getenv("MESSAGE_RETENTION_DAYS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return 0, errors.New("MESSAGE_RETENTION_DAYS must be a whole number of days, at least 1")
+		}
+		days = n
+	}
+	return time.Duration(days) * 24 * time.Hour, nil
 }
 
 // validPhone accepts an international number as digits only: no "+", spaces or leading 0.
