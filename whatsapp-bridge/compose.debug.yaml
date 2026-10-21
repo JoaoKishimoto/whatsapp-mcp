@@ -1,0 +1,7 @@
+# Testing only: publishes the API on this machine's loopback, so a0-check.sh can reach it.
+#   docker compose -f compose.yaml -f compose.debug.yaml up -d
+# Never bind it to 0.0.0.0: the tokens would be the only thing between the internet and the bot.
+services:
+  wa-gateway:
+    ports:
+      - "127.0.0.1:8080:8080"

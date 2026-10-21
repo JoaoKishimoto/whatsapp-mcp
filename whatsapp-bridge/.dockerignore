@@ -1,0 +1,7 @@
+# Allowlist: only the source goes into the build context. The session store, the
+# secrets file and local binaries never leave this machine through a build.
+*
+!go.mod
+!go.sum
+!cmd
+!internal

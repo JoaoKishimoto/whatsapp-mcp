@@ -6,6 +6,7 @@
 #   (set -a; . ./.env; set +a; bash a0-check.sh groups) # creates a test community + topic group with you as admin
 #   (set -a; . ./.env; set +a; bash a0-check.sh groups 1203…@g.us)  # reuses that community, creates only the topic group
 #   (set -a; . ./.env; set +a; bash a0-check.sh g8)     # typing, 👀 reaction and read receipt on your latest DM and group message
+# Gateway in Docker: start it with compose.debug.yaml, which publishes the API on 127.0.0.1:8080 only.
 # A 429 (rate-overlimit) means WhatsApp is limiting this number: wait hours, do not retry in a loop.
 # Reads TOKEN_BRIDGE, TOKEN_NOTIFY and OWNER_PHONE from the environment and never prints the tokens.
 # Read-only on the queue: it does not ack events, so you can run it again.
