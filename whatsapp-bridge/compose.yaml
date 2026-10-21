@@ -1,0 +1,47 @@
+# wa-gateway on the VPS (PLANO.md §9). From this folder:
+#   docker network create proxy                                    # once, if Caddy has not made it yet
+#   docker compose build
+#   docker compose run --rm wa-gateway pair --phone <bot number>   # once, with the gateway stopped
+#   docker compose up -d
+# The API has no published port: other containers on the proxy network reach http://wa-gateway:8080.
+# To run a0-check.sh from the host, add compose.debug.yaml (publishes it on 127.0.0.1 only).
+services:
+  wa-gateway:
+    build: .
+    image: wa-gateway:local
+    container_name: wa-gateway
+    restart: unless-stopped
+    env_file: .env # TOKEN_BRIDGE, TOKEN_NOTIFY, OWNER_PHONE: copy .env.example
+    volumes:
+      - wa-store:/data # whatsapp.db holds the bot's session keys: back it up encrypted only
+      - wa-media:/media # attachments in and out; the bridge mounts the same volume
+    networks: [proxy]
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    pids_limit: 128
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "/wa-gateway", "health"]
+      interval: 1m
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  wa-store:
+  wa-media:
+    name: wa-media # fixed name, so the bridge's compose project can use it as external
+
+networks:
+  proxy:
+    external: true

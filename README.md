@@ -39,10 +39,11 @@ Here's an example of what you can do when it's connected to Claude.
 
    ```bash
    cd whatsapp-bridge
-   go run main.go
+   go run ./cmd/wa-gateway pair    # once: shows a QR code (or --phone <number> for a pairing code)
+   go run ./cmd/wa-gateway         # then run the bridge
    ```
 
-   The first time you run it, you will be prompted to scan a QR code. Scan the QR code with your WhatsApp mobile app to authenticate.
+   Pair once by scanning the QR code with your WhatsApp mobile app (Linked devices), or with `--phone` type the 8-character code it prints.
 
    After approximately 20 days, you will might need to re-authenticate.
 
@@ -78,28 +79,10 @@ Here's an example of what you can do when it's connected to Claude.
    ~/.cursor/mcp.json
    ```
 
-4. **Restart Claude Desktop / Cursor**
+4. ### Windows Compatibility
 
-   Open Claude Desktop and you should now see WhatsApp as an available integration.
+No C compiler or CGO is needed: the bridge uses a pure-Go SQLite driver.
 
-   Or restart Cursor.
-
-### Windows Compatibility
-
-If you're running this project on Windows, be aware that `go-sqlite3` requires **CGO to be enabled** in order to compile and work properly. By default, **CGO is disabled on Windows**, so you need to explicitly enable it and have a C compiler installed.
-
-#### Steps to get it working:
-
-1. **Install a C compiler**  
-   We recommend using [MSYS2](https://www.msys2.org/) to install a C compiler for Windows. After installing MSYS2, make sure to add the `ucrt64\bin` folder to your `PATH`.  
-   → A step-by-step guide is available [here](https://code.visualstudio.com/docs/cpp/config-mingw).
-
-2. **Enable CGO and run the app**
-
-   ```bash
-   cd whatsapp-bridge
-   go env -w CGO_ENABLED=1
-   go run main.go
    ```
 
 Without this setup, you'll likely run into errors like:
