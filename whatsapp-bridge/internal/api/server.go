@@ -44,6 +44,8 @@ type WhatsApp interface {
 	SendText(ctx context.Context, to types.JID, text string, reply *Reply) (messageID string, err error)
 	// SendPoll returns the poll's message id and the chat JID it went to (needed to match votes).
 	SendPoll(ctx context.Context, to, question string, options []string, selectable int) (messageID, chatJID string, err error)
+	// Lookup reports whether phone (digits) has WhatsApp, and the JID WhatsApp has for it.
+	Lookup(ctx context.Context, phone string) (jid types.JID, onWhatsApp bool, err error)
 	Health() Health
 	Groups
 	Chat
@@ -83,6 +85,7 @@ func New(cfg Config, wa WhatsApp, q *queue.Store, p *polls.Store) (*Server, erro
 	s.mux.Handle("POST /v1/events/ack", s.require(scopeBridge, s.ackEvents))
 	s.mux.Handle("POST /v1/messages", s.require(scopeNotify, s.sendMessage))
 	s.mux.Handle("POST /v1/polls", s.require(scopeBridge, s.sendPoll))
+	s.mux.Handle("POST /v1/contacts/lookup", s.require(scopeBridge, s.lookupContact))
 	s.routeGroups()
 	s.routeChat()
 	s.routeMedia()
@@ -223,6 +226,40 @@ func (s *Server) sendPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"message_id": id})
+}
+
+// lookupContact checks a number before the first message to it. The JID can differ from
+// the digits sent (an old Brazilian account without the extra 9): send to the JID.
+func (s *Server) lookupContact(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Phone string `json:"phone"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !plausiblePhone(req.Phone) {
+		writeError(w, http.StatusBadRequest, "phone must be 10 to 15 digits, country code included")
+		return
+	}
+	jid, ok, err := s.wa.Lookup(r.Context(), req.Phone)
+	if err != nil {
+		waFailed(w, "lookup", err)
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusOK, map[string]any{"on_whatsapp": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"on_whatsapp": true, "jid": jid.String()})
+}
+
+func plausiblePhone(s string) bool {
+	if len(s) < 10 || len(s) > 15 {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func validatePoll(to, question string, options []string, selectable int) string {

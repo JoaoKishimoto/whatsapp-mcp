@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
 
 	"whatsapp-client/internal/polls"
@@ -34,11 +36,12 @@ type sentPoll struct {
 }
 
 type fakeWA struct {
-	sent  []sent
-	polls []sentPoll
-	calls []call // group and chat methods record here (groups_test.go, chat_test.go)
-	fail  bool
-	err   error // returned by group methods when set
+	sent       []sent
+	polls      []sentPoll
+	calls      []call // group, chat and lookup methods record here (groups_test.go, chat_test.go)
+	fail       bool
+	err        error                // returned by group, chat and lookup methods when set
+	registered map[string]types.JID // phone digits -> JID WhatsApp has for them, for Lookup
 }
 
 func (f *fakeWA) SendPoll(_ context.Context, to, question string, options []string, selectable int) (string, string, error) {
@@ -55,6 +58,14 @@ func (f *fakeWA) SendText(_ context.Context, to types.JID, text string, reply *R
 	}
 	f.sent = append(f.sent, sent{to.User, text, reply})
 	return "3EB0SENT", nil
+}
+
+func (f *fakeWA) Lookup(_ context.Context, phone string) (types.JID, bool, error) {
+	if err := f.record("lookup", phone); err != nil {
+		return types.JID{}, false, err
+	}
+	jid, ok := f.registered[phone]
+	return jid, ok, nil
 }
 
 func (f *fakeWA) Health() Health { return Health{Connected: true, LoggedIn: true} }
@@ -266,5 +277,95 @@ func TestPollValidation(t *testing.T) {
 	}
 	if len(wa.polls) != 0 {
 		t.Errorf("sent %v", wa.polls)
+	}
+}
+
+func lookup(t *testing.T, s http.Handler, token, body string) (int, map[string]any) {
+	t.Helper()
+	w := do(s, "POST", "/v1/contacts/lookup", token, body)
+	var resp map[string]any
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	return w.Code, resp
+}
+
+func TestLookupOnWhatsApp(t *testing.T) {
+	s, wa, _ := setup(t)
+	wa.registered = map[string]types.JID{"5511900000001": types.NewJID("5511900000001", types.DefaultUserServer)}
+	code, resp := lookup(t, s, bridgeTok, `{"phone":"5511900000001"}`)
+	if code != 200 || resp["on_whatsapp"] != true || resp["jid"] != "5511900000001@s.whatsapp.net" {
+		t.Errorf("got %d %v", code, resp)
+	}
+	if len(wa.calls) != 1 || wa.calls[0].args != "5511900000001" {
+		t.Errorf("calls = %+v, want the digits as sent", wa.calls)
+	}
+}
+
+func TestLookupNotOnWhatsApp(t *testing.T) {
+	s, _, _ := setup(t)
+	code, resp := lookup(t, s, bridgeTok, `{"phone":"5511900000002"}`)
+	if _, hasJID := resp["jid"]; code != 200 || resp["on_whatsapp"] != false || hasJID {
+		t.Errorf("got %d %v", code, resp)
+	}
+}
+
+// An old Brazilian account may be registered without the extra 9: the JID WhatsApp has wins.
+func TestLookupReturnsWhatsAppsJID(t *testing.T) {
+	s, wa, _ := setup(t)
+	wa.registered = map[string]types.JID{"5511900000003": types.NewJID("551100000003", types.DefaultUserServer)}
+	code, resp := lookup(t, s, bridgeTok, `{"phone":"5511900000003"}`)
+	if code != 200 || resp["on_whatsapp"] != true || resp["jid"] != "551100000003@s.whatsapp.net" {
+		t.Errorf("got %d %v", code, resp)
+	}
+}
+
+func TestLookupValidation(t *testing.T) {
+	s, wa, _ := setup(t)
+	for _, body := range []string{
+		`not json`,
+		`{}`,
+		`{"phone":""}`,
+		`{"phone":5511900000001}`,
+		`{"phone":"+5511900000001"}`,
+		`{"phone":"55 11 90000-0001"}`,
+		`{"phone":"5511900000001@s.whatsapp.net"}`,
+		`{"phone":"551190000"}`,        // 9 digits
+		`{"phone":"5511900000000001"}`, // 16 digits
+	} {
+		if code, _ := lookup(t, s, bridgeTok, body); code != 400 {
+			t.Errorf("%s: got %d", body, code)
+		}
+	}
+	for _, body := range []string{`{"phone":"1190000001"}`, `{"phone":"551190000000001"}`} { // 10 and 15 digits
+		if code, _ := lookup(t, s, bridgeTok, body); code != 200 {
+			t.Errorf("%s: got %d", body, code)
+		}
+	}
+	if len(wa.calls) != 2 {
+		t.Errorf("calls = %+v, want only the two valid lookups", wa.calls)
+	}
+}
+
+func TestLookupNeedsBridgeToken(t *testing.T) {
+	s, wa, _ := setup(t)
+	if code, _ := lookup(t, s, notifyTok, `{"phone":"5511900000001"}`); code != 403 {
+		t.Errorf("notify: got %d", code)
+	}
+	if code, _ := lookup(t, s, "", `{"phone":"5511900000001"}`); code != 401 {
+		t.Errorf("no token: got %d", code)
+	}
+	if len(wa.calls) != 0 {
+		t.Errorf("calls = %+v", wa.calls)
+	}
+}
+
+func TestLookupFailures(t *testing.T) {
+	s, wa, _ := setup(t)
+	wa.err = fmt.Errorf("failed to send usync query: %w", whatsmeow.ErrIQRateOverLimit)
+	if code, resp := lookup(t, s, bridgeTok, `{"phone":"5511900000001"}`); code != 429 || !strings.Contains(fmt.Sprint(resp["error"]), "rate-overlimit") {
+		t.Errorf("rate limit: got %d %v", code, resp)
+	}
+	wa.err = whatsmeow.ErrNotConnected
+	if code, _ := lookup(t, s, bridgeTok, `{"phone":"5511900000001"}`); code != 502 {
+		t.Errorf("not connected: got %d", code)
 	}
 }
