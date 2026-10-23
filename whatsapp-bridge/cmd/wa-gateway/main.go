@@ -466,6 +466,17 @@ func (w waClient) SendPoll(ctx context.Context, to, question string, options []s
 	return resp.ID, jid.String(), err
 }
 
+// Lookup asks WhatsApp whether phone (digits, country code included) has an account.
+func (w waClient) Lookup(ctx context.Context, phone string) (types.JID, bool, error) {
+	resps, err := w.c.IsOnWhatsApp(ctx, []string{"+" + phone})
+	if err != nil && len(resps) == 0 {
+		return types.JID{}, false, err
+	}
+	// An answer that comes with an error only failed to save the LID mapping locally.
+	jid, ok := wa.Registered(resps)
+	return jid, ok, nil
+}
+
 func (w waClient) Health() api.Health {
 	return api.Health{Connected: w.c.IsConnected(), LoggedIn: w.c.IsLoggedIn()}
 }

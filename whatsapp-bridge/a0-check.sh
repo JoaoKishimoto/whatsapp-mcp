@@ -70,6 +70,9 @@ else
 	echo "FAIL  not connected/logged in: $(cat "$body")"
 	fail=$((fail + 1))
 fi
+code=$(call POST /v1/contacts/lookup "$TOKEN_BRIDGE" "{\"phone\":\"$OWNER_PHONE\"}")
+grep -Eq '"on_whatsapp": *true' "$body" || code="$code, on_whatsapp not true"
+check "lookup finds your number on WhatsApp" 200 "$code"
 
 echo "== 2. Tokens"
 check "no token is refused" 401 "$(call GET /v1/events "")"
