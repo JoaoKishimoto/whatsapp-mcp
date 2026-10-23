@@ -2,6 +2,8 @@
 package wa
 
 import (
+	"slices"
+	"strings"
 	"time"
 
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -31,6 +33,12 @@ type Attachment struct {
 	PTT      bool   `json:"ptt,omitempty"` // a voice note (audio recorded in the chat)
 }
 
+// Contact is a shared contact card: its name and phone numbers, nothing else from the vCard.
+type Contact struct {
+	Name   string   `json:"name"`
+	Phones []string `json:"phones"` // digits, e.g. "5571999999999"; empty (never null) when the card has none
+}
+
 type Message struct {
 	MessageID string    `json:"message_id"`
 	EditOf    string    `json:"edit_of,omitempty"` // set when this is an edit of an earlier message
@@ -44,6 +52,7 @@ type Message struct {
 	Text           string      `json:"text,omitempty"`
 	Quoted         *Quoted     `json:"quoted,omitempty"`
 	Attachment     *Attachment `json:"attachment,omitempty"`
+	Contacts       []Contact   `json:"contacts,omitempty"`
 }
 
 // Normalize converts a whatsmeow message. ok is false for messages the gateway
@@ -73,6 +82,7 @@ func Normalize(evt *events.Message) (msg Message, ok bool) {
 
 	msg.Text = textOf(content)
 	msg.Attachment = attachmentOf(content)
+	msg.Contacts = contactsOf(content)
 	if ctx := contextInfoOf(content); ctx.GetStanzaID() != "" {
 		msg.Quoted = &Quoted{
 			MessageID: ctx.GetStanzaID(),
@@ -80,7 +90,7 @@ func Normalize(evt *events.Message) (msg Message, ok bool) {
 			Text:      textOf(ctx.GetQuotedMessage()),
 		}
 	}
-	if msg.Text == "" && msg.Attachment == nil {
+	if msg.Text == "" && msg.Attachment == nil && len(msg.Contacts) == 0 {
 		return Message{}, false
 	}
 	return msg, true
@@ -174,6 +184,85 @@ func contextInfoOf(m *waE2E.Message) *waE2E.ContextInfo {
 		return m.GetDocumentMessage().GetContextInfo()
 	case m.GetStickerMessage() != nil:
 		return m.GetStickerMessage().GetContextInfo()
+	case m.GetContactMessage() != nil:
+		return m.GetContactMessage().GetContextInfo()
+	case m.GetContactsArrayMessage() != nil:
+		return m.GetContactsArrayMessage().GetContextInfo()
 	}
 	return nil
+}
+
+// maxContacts caps a contactsArrayMessage; the phone lets you share many more at once.
+const maxContacts = 10
+
+func contactsOf(m *waE2E.Message) []Contact {
+	cards := m.GetContactsArrayMessage().GetContacts()
+	if c := m.GetContactMessage(); c != nil {
+		cards = []*waE2E.ContactMessage{c}
+	}
+	var out []Contact
+	for _, card := range cards {
+		if len(out) == maxContacts {
+			break
+		}
+		fn, phones := parseVCard(card.GetVcard())
+		name := strings.TrimSpace(card.GetDisplayName())
+		if name == "" {
+			name = fn
+		}
+		if name != "" || len(phones) > 0 {
+			out = append(out, Contact{Name: name, Phones: phones})
+		}
+	}
+	return out
+}
+
+var (
+	vcardUnfolder  = strings.NewReplacer("\r\n ", "", "\r\n\t", "", "\n ", "", "\n\t", "")
+	vcardUnescaper = strings.NewReplacer(`\,`, ",", `\;`, ";", `\\`, `\`, `\n`, " ", `\N`, " ")
+)
+
+// parseVCard reads FN and the TEL numbers off a vCard and ignores every other field.
+// A TEL's waid= parameter (the WhatsApp account, put there by WhatsApp) wins over the
+// number as written. Phones are digits only, deduplicated, in card order.
+func parseVCard(vcard string) (fn string, phones []string) {
+	phones = []string{}
+	for _, line := range strings.Split(vcardUnfolder.Replace(vcard), "\n") {
+		head, value, ok := strings.Cut(strings.TrimRight(line, "\r"), ":")
+		if !ok {
+			continue
+		}
+		params := strings.Split(head, ";")
+		prop := strings.ToUpper(params[0])
+		if i := strings.LastIndexByte(prop, '.'); i >= 0 {
+			prop = prop[i+1:] // "item1.TEL" is TEL
+		}
+		switch prop {
+		case "FN":
+			if fn == "" {
+				fn = strings.TrimSpace(vcardUnescaper.Replace(value))
+			}
+		case "TEL":
+			number := digitsOf(value)
+			for _, p := range params[1:] {
+				if k, v, _ := strings.Cut(p, "="); strings.EqualFold(k, "waid") && digitsOf(v) != "" {
+					number = digitsOf(v)
+				}
+			}
+			if number != "" && !slices.Contains(phones, number) {
+				phones = append(phones, number)
+			}
+		}
+	}
+	return fn, phones
+}
+
+func digitsOf(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
